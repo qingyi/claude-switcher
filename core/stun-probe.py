@@ -1,69 +1,70 @@
 #!/usr/bin/env python3
-"""WebRTC 泄漏探测:并发向多个 STUN 服务器(含国内节点)发 UDP Binding 请求。
-走隧道时应得到代理出口 IP,裸连时会暴露真实国内 IP。全程硬超时 10 秒,绝不阻塞。"""
-import socket, struct, os, signal, threading
+"""Bounded STUN observations, not a proof of all WebRTC traffic being blocked."""
+import concurrent.futures
+import ipaddress
+import json
+import os
+import signal
+import socket
+import struct
+import sys
 
-SERVERS = [
-    ("stun.miwifi.com", 3478),        # 国内节点:裸连时必有响应
-    ("stun.chat.bilibili.com", 3478), # 国内节点
-    ("stun.l.google.com", 19302),     # 全球节点
-    ("stun.cloudflare.com", 3478),    # 全球节点
-]
+SERVERS=(('stun.miwifi.com',3478),('stun.chat.bilibili.com',3478),('stun.l.google.com',19302),('stun.cloudflare.com',3478))
+MAGIC=0x2112A442
 
-def stun_public_ip(host, port, timeout=2.0):
-    try:
-        addr = socket.gethostbyname(host)
-    except Exception:
-        return None
-    txn = os.urandom(12)
-    req = struct.pack("!HHI", 0x0001, 0, 0x2112A442) + txn
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(timeout)
-    try:
-        s.sendto(req, (addr, port))
-        data, _ = s.recvfrom(1024)
-    except Exception:
-        return None
-    finally:
-        s.close()
-    if len(data) < 20 or data[0:2] != b"\x01\x01":
-        return None
-    pos = 20
-    while pos + 4 <= len(data):
-        atype, alen = struct.unpack("!HH", data[pos:pos+4])
-        aval = data[pos+4:pos+4+alen]
-        if atype == 0x0020 and len(aval) >= 8 and aval[1] == 0x01:
-            ip_int = struct.unpack("!I", aval[4:8])[0] ^ 0x2112A442
-            return socket.inet_ntoa(struct.pack("!I", ip_int))
-        if atype == 0x0001 and len(aval) >= 8 and aval[1] == 0x01:
-            return socket.inet_ntoa(aval[4:8])
-        pos += 4 + alen + ((4 - alen % 4) % 4)
+
+def parse_response(data, txn):
+    if len(data)<20:return None
+    typ,length,cookie,received=struct.unpack('!HHI12s',data[:20])
+    if typ!=0x0101 or cookie!=MAGIC or received!=txn or length%4 or len(data)<20+length:return None
+    pos=20
+    while pos+4<=20+length:
+        kind,size=struct.unpack('!HH',data[pos:pos+4])
+        if pos+4+size>20+length:return None
+        value=data[pos+4:pos+4+size]
+        if kind in (0x0020,0x0001) and size>=8 and value[1]==1:
+            address=value[4:8]
+            if kind==0x0020:address=bytes(a^b for a,b in zip(address,struct.pack('!I',MAGIC)))
+            return str(ipaddress.IPv4Address(address))
+        pos+=4+size+(-size%4)
     return None
 
-def _alarm(signum, frame):
-    raise TimeoutError
+
+def probe(host,port):
+    txn=os.urandom(12)
+    try:
+        addr=socket.gethostbyname(host)
+        with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as s:
+            s.settimeout(2)
+            s.connect((addr,port))
+            s.send(struct.pack('!HHI12s',0x0001,0,MAGIC,txn))
+            data=s.recv(2048)
+        return parse_response(data,txn)
+    except OSError:return None
+
+
+def output(addresses, timed_out=False):
+    result={'status':'responses' if addresses else 'no_response','addresses':sorted(addresses),'timed_out':timed_out}
+    if '--json' in sys.argv:print(json.dumps(result))
+    else:print('RESULT:'+(','.join(sorted(addresses)) if addresses else 'NONE'))
+
 
 def main():
-    found = []
-    lock = threading.Lock()
-    def worker(h, p):
-        ip = stun_public_ip(h, p)
-        if ip:
-            with lock:
-                if ip not in found:
-                    found.append(ip)
-    threads = []
-    for h, p in SERVERS:
-        t = threading.Thread(target=worker, args=(h, p), daemon=True)
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join(timeout=3)
-    print("RESULT:" + (",".join(found) if found else "NONE"))
+    addresses=set()
+    def alarm(*_):
+        # DNS may block inside a worker. Exit the whole process, not just its main thread.
+        output(addresses,True)
+        sys.stdout.flush()
+        os._exit(0)
+    signal.signal(signal.SIGALRM,alarm)
+    signal.alarm(8)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futures=[pool.submit(probe,*hp) for hp in SERVERS]
+        for future in concurrent.futures.as_completed(futures):
+            address=future.result()
+            if address:addresses.add(address)
+    signal.alarm(0)
+    output(addresses)
 
-signal.signal(signal.SIGALRM, _alarm)
-signal.alarm(10)
-try:
-    main()
-except TimeoutError:
-    print("RESULT:NONE")
+
+if __name__=='__main__':main()

@@ -4,3 +4,14 @@ accounts/
 lastip
 last-check.txt
 *.log
+
+build/
+__pycache__/
+
+# Private runtime state must never be published.
+.claude-switcher/
+file-access.plist
+guard-heartbeat.json
+managed-session.json
+installation-backups/
+Claude-Shadowrocket.conf

@@ -1,9 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- launchd 模板: 安装程序会替换 __HOME__ 后安装到 /Library/LaunchDaemons -->
+<!-- User LaunchAgent. Installer substitutes paths and the actual Python executable. -->
 <plist version="1.0"><dict>
-	<key>Label</key><string>local.claude-bodyguard</string>
-	<key>ProgramArguments</key><array><string>/bin/bash</string><string>__HOME__/.local/bin/claude-bodyguard.sh</string></array>
-	<key>StartInterval</key><integer>10</integer>
-	<key>RunAtLoad</key><true/>
+<key>Label</key><string>local.claude-switcher.bodyguard</string>
+<key>ProgramArguments</key><array><string>__PYTHON__</string><string>__HOME__/.claude-switcher/claude-switch.py</string><string>guard</string></array>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
 </dict></plist>

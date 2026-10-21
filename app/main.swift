@@ -1,5 +1,64 @@
 import SwiftUI
 import AppKit
+import Darwin
+
+// User-selected, file-scoped access to Shadowrocket metadata and the active profile.
+final class ProfileAccess {
+    static let shared = ProfileAccess()
+    private var urls: [URL] = []
+    private let home = FileManager.default.homeDirectoryForCurrentUser
+    private var store: URL { home.appendingPathComponent(".claude-switcher/file-access.plist") }
+
+    func restore() {
+        guard let data = try? Data(contentsOf: store),
+              let bookmarks = try? PropertyListDecoder().decode([Data].self, from: data) else { return }
+        for bookmark in bookmarks {
+            var stale = false
+            if let url = try? URL(resolvingBookmarkData: bookmark, options: [.withSecurityScope, .withoutUI],
+                                  relativeTo: nil, bookmarkDataIsStale: &stale), !stale {
+                _ = url.startAccessingSecurityScopedResource()
+                urls.append(url)
+            }
+        }
+    }
+
+    private func select(_ expected: URL, title: String) throws -> Data {
+        let panel = NSOpenPanel()
+        panel.title = title
+        panel.message = "只读检查当前生效规则。请选择下方指定文件，不需要授权整个文件夹。"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = expected.deletingLastPathComponent()
+        panel.nameFieldStringValue = expected.lastPathComponent
+        guard panel.runModal() == .OK, let url = panel.url,
+              url.standardizedFileURL == expected.standardizedFileURL else {
+            throw NSError(domain: "ProfileAccess", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "未选择指定配置文件，授权未完成"])
+        }
+        _ = url.startAccessingSecurityScopedResource()
+        urls.append(url)
+        _ = try Data(contentsOf: url)
+        return try url.bookmarkData(options: [.withSecurityScope, .securityScopeAllowOnlyReadAccess], includingResourceValuesForKeys: nil, relativeTo: nil)
+    }
+
+    func authorize() throws {
+        let pref = home.appendingPathComponent("Library/Group Containers/group.com.liguangming.Shadowrocket/Library/Preferences/group.com.liguangming.Shadowrocket.plist")
+        let first = try select(pref, title: "1/2：允许读取 Shadowrocket 当前配置名称")
+        let data = try Data(contentsOf: pref)
+        guard let dict = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let name = dict["group.com.liguangming.CurrentRuleFileName"] as? String,
+              (name as NSString).lastPathComponent == name, name.hasSuffix(".db") else {
+            throw NSError(domain: "ProfileAccess", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "未找到当前启用的配置，请先在 Shadowrocket 使用配置"])
+        }
+        let db = home.appendingPathComponent("Library/Containers/com.liguangming.Shadowrocket/Data/Documents/Databases/" + name)
+        let second = try select(db, title: "2/2：允许读取当前 Shadowrocket 配置数据库")
+        let encoded = try PropertyListEncoder().encode([first, second])
+        try encoded.write(to: store, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: store.path)
+    }
+}
 
 // MARK: - 模型
 
@@ -21,13 +80,16 @@ final class VM: ObservableObject {
         CheckRow(name: "TUN 网卡", icon: "cable.connector"),
         CheckRow(name: "出口 IP", icon: "globe.americas"),
         CheckRow(name: "IP 与上次一致", icon: "checkmark.seal"),
-        CheckRow(name: "时区(纽约)", icon: "clock"),
-        CheckRow(name: "地区(美国)", icon: "flag"),
-        CheckRow(name: "IPv6 关闭", icon: "6.circle"),
+        CheckRow(name: "系统时区", icon: "clock"),
+        CheckRow(name: "系统地区", icon: "flag"),
+        CheckRow(name: "IPv6 路径", icon: "6.circle"),
         CheckRow(name: "DNS 走隧道", icon: "magnifyingglass"),
         CheckRow(name: "WebRTC", icon: "eye.slash"),
         CheckRow(name: "保镖在线", icon: "hand.raised"),
         CheckRow(name: "规则置顶", icon: "list.number"),
+        CheckRow(name: "客户端语言", icon: "character.bubble"),
+        CheckRow(name: "ASN 属性", icon: "network"),
+        CheckRow(name: "服务连通性", icon: "antenna.radiowaves.left.and.right"),
     ]
     @Published var phase: Phase = .checking
     @Published var current = "?"
@@ -37,13 +99,13 @@ final class VM: ObservableObject {
 
     let core = NSHomeDirectory() + "/.local/bin/claude-switch.sh"
 
-    func run(_ args: [String], timeout: TimeInterval = 45, done: @escaping (String) -> Void) {
+    func run(_ args: [String], timeout: TimeInterval = 90, done: @escaping (String) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             let started = Date()
             let tmp = "/tmp/switcher-out-\(UUID().uuidString).txt"
             FileManager.default.createFile(atPath: tmp, contents: nil)
             let p = Process()
-            p.launchPath = "/bin/bash"
+            p.executableURL = URL(fileURLWithPath: "/bin/bash")
             p.arguments = [self.core] + args
             if let fh = try? FileHandle(forWritingTo: URL(fileURLWithPath: tmp)) {
                 p.standardOutput = fh
@@ -54,7 +116,7 @@ final class VM: ObservableObject {
                 if p.isRunning { timedOut = true; p.terminate() }
             }
             DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
-            do { try p.launch() } catch {
+            do { try p.run() } catch {
                 DispatchQueue.main.async { done("FAIL:无法启动脚本 \(error.localizedDescription)") }
                 return
             }
@@ -82,29 +144,24 @@ final class VM: ObservableObject {
         note = ""
         for i in rows.indices { rows[i].state = .pending; rows[i].detail = "" }
         run(["checkdetail"]) { out in
-            // 输出为空时回退到脚本落盘的结果文件(双保险)
-            var raw = out
-            if raw.isEmpty, let diskData = try? Data(contentsOf: URL(fileURLWithPath: NSHomeDirectory() + "/.claude-switcher/last-check.txt")), !diskData.isEmpty {
-                raw = String(decoding: diskData, as: UTF8.self)
-            }
-            let out = raw
             var allOk = true
-            var matched = 0
+            var matched = Set<String>()
             let keyMap: [String: String] = [
                 "代理内核": "代理内核", "TUN网卡": "TUN 网卡", "出口IP": "出口 IP",
-                "IP一致": "IP 与上次一致", "时区": "时区(纽约)", "地区": "地区(美国)",
-                "IPv6": "IPv6 关闭", "DNS": "DNS 走隧道", "WebRTC": "WebRTC",
+                "IP一致": "IP 与上次一致", "时区": "系统时区", "地区": "系统地区",
+                "IPv6": "IPv6 路径", "DNS": "DNS 走隧道", "WebRTC": "WebRTC",
                 "保镖": "保镖在线", "规则置顶": "规则置顶",
+                "客户端语言": "客户端语言", "ASN属性": "ASN 属性", "生态可达性": "服务连通性",
             ]
             for line in out.split(separator: "\n") {
                 let parts = line.split(separator: "=", maxSplits: 1).map(String.init)
                 guard parts.count == 2 else { continue }
                 let rhs = parts[1]
                 let status = rhs.split(separator: ":", maxSplits: 1).map(String.init)
-                let code = status[0]
+                guard let code = status.first else { continue }
                 let detail = status.count > 1 ? status[1] : ""
                 guard let rowName = keyMap[parts[0]], let idx = self.rows.firstIndex(where: { $0.name == rowName }) else { continue }
-                matched += 1
+                matched.insert(parts[0])
                 switch code {
                 case "ok": self.rows[idx].state = .ok
                 case "warn": self.rows[idx].state = .warn
@@ -115,11 +172,13 @@ final class VM: ObservableObject {
             self.run(["status"]) { st in
                 self.current = st.contains("current=B") ? "B" : (st.contains("current=A") ? "A" : "未初始化")
                 self.hasB = st.contains("hasB=1")
-                if matched < self.rows.count {
-                    self.banner = "检测输出不完整(\(matched)/\(self.rows.count))，请点重新检查"
+                if matched.count < self.rows.count {
+                    self.banner = "检测输出不完整(\(matched.count)/\(self.rows.count))，请点重新检查"
                     self.phase = .failed
                 } else {
                     self.phase = allOk ? .ready : .failed
+                    let warnings = self.rows.filter { $0.state == .warn }.count
+                    self.note = warnings > 0 ? "有 \(warnings) 项提示，请阅读检查详情。" : ""
                 }
             }
         }
@@ -127,7 +186,7 @@ final class VM: ObservableObject {
 
     func fixAll() {
         phase = .fixing
-        banner = "正在修复…（若弹出密码框请输入开机密码）"
+        banner = "正在准备 Shadowrocket 与用户级保护…"
         run(["fix"], timeout: 180) { out in
             let steps = out.split(separator: "\n").map(String.init).filter { $0.hasPrefix("FIX:") }.map { String($0.dropFirst(4)) }
             self.banner = steps.last ?? ""
@@ -138,8 +197,8 @@ final class VM: ObservableObject {
     func switchTo(_ target: String) {
         phase = .switching
         banner = "正在切换到账号 \(target)…"
-        run(["switch", target], timeout: 180) { out in
-            if out.hasPrefix("FAIL:") {
+        run(["switch", target], timeout: 900) { out in
+            if out.hasPrefix("FAIL:") || !(out.hasPrefix("OK:") || out.hasPrefix("INFO:")) {
                 self.phase = .failed
                 self.banner = String(out.dropFirst(5))
                 return
@@ -170,7 +229,7 @@ struct ContentView: View {
                            startPoint: .top, endPoint: .bottom).ignoresSafeArea()
             VStack(spacing: 16) {
                 header
-                checksCard
+                ScrollView { checksCard }.frame(maxHeight: 490)
                 if vm.phase == .ready || vm.phase == .switching || vm.phase == .done {
                     accountCard
                 } else if vm.phase == .failed || vm.phase == .fixing {
@@ -181,7 +240,7 @@ struct ContentView: View {
             }
             .padding(20)
         }
-        .frame(width: 440, height: 740)
+        .frame(width: 440, height: 850)
         .onAppear { vm.refresh() }
     }
 
@@ -195,7 +254,7 @@ struct ContentView: View {
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text("Claude 账号切换器").font(.title3.bold()).foregroundColor(.white)
-                Text("安全检查 · 切换 · 启动").font(.caption).foregroundColor(.white.opacity(0.55))
+                Text("Shadowrocket · 安检 · 账号快照").font(.caption).foregroundColor(.white.opacity(0.55))
             }
             Spacer()
             Button { showNotice = true } label: {
@@ -212,7 +271,7 @@ struct ContentView: View {
         let (txt, color): (String, Color) = {
             switch vm.phase {
             case .checking: return ("检查中", .orange)
-            case .ready: return ("环境安全", .green)
+            case .ready: return ("可启动", .green)
             case .failed: return ("检查未过", .red)
             case .switching: return ("切换中", .blue)
             case .fixing: return ("修复中", .orange)
@@ -279,6 +338,7 @@ struct ContentView: View {
                 }
                 .frame(maxWidth: .infinity).padding(.vertical, 10)
             } else {
+                if !vm.note.isEmpty { Text(vm.note).font(.caption).foregroundColor(.yellow) }
                 HStack(spacing: 6) {
                     Text("当前账号").font(.caption).foregroundColor(.white.opacity(0.5))
                     Text(vm.current).font(.caption.bold())
@@ -288,7 +348,7 @@ struct ContentView: View {
                     Spacer()
                 }
                 HStack(spacing: 10) {
-                    accountButton("A", subtitle: vm.current == "A" ? "当前" : "已建档")
+                    accountButton("A", subtitle: vm.current == "A" ? "当前" : "启动 / 切换")
                     accountButton("B", subtitle: vm.current == "B" ? "当前" : (vm.hasB ? "已建档" : "未初始化"))
                 }
             }
@@ -328,7 +388,7 @@ struct ContentView: View {
                 if !vm.banner.isEmpty {
                     Text(vm.banner).font(.callout).foregroundColor(.red.opacity(0.95)).multilineTextAlignment(.center)
                 }
-                Text("存在未通过项，可一键修复或手动处理后重试").font(.caption).foregroundColor(.white.opacity(0.6))
+                Text("故障会阻止启动；环境提示保留系统偏好。修复可安装用户级保护并打开配置导入。").font(.caption).foregroundColor(.white.opacity(0.6))
                 HStack(spacing: 10) {
                     Button { vm.fixAll() } label: {
                         Label("一键修复", systemImage: "wand.and.stars")
@@ -361,7 +421,22 @@ struct ContentView: View {
     var footer: some View {
         HStack {
             Image(systemName: "lock.shield").font(.caption2)
-            Text("任何一项检查不过，都不会启动 Claude").font(.caption2)
+            Text("故障阻止启动 · 提示保留原设置")
+            Spacer()
+            Button("授权读取配置") {
+                do {
+                    try ProfileAccess.shared.authorize()
+                    vm.run(["install-guard"]) { _ in vm.refresh() }
+                } catch { vm.banner = error.localizedDescription }
+            }.buttonStyle(.plain)
+            Button("刷新") { vm.refresh() }.buttonStyle(.plain)
+            Button("恢复") {
+                vm.run(["recover"]) { result in
+                    vm.banner = result
+                    vm.refresh()
+                    vm.banner = result
+                }
+            }.buttonStyle(.plain).font(.caption2)
         }
         .foregroundColor(.white.opacity(0.35))
     }
@@ -373,13 +448,12 @@ struct NoticeView: View {
     @Environment(\.dismiss) private var dismiss
 
     let sections: [(String, String)] = [
-        ("Full-Tunnel 全流量接管", "基于 TUN 虚拟网卡的内核级流量劫持，配合 Fake-IP DNS 解析机制，包括 UDP 在内的全部出站流量在网络栈底层被强制路由至加密隧道，应用层无法旁路。"),
-        ("Environment Audit 环境一致性审计", "每次启动前执行 11 项环境指纹审计：Egress IP 归属地与 ASN 属性、时区与 Geo-location 一致性、Locale、IPv6 双栈旁路、DNS Leak、WebRTC/STUN 多节点交叉探测等。任一指标不达标即 Block-on-Fail，杜绝带病启动。"),
-        ("Kill-Switch 断网急停", "常驻守护进程以 10 秒周期巡检隧道健康度，隧道中断即刻终止受保护进程，确保没有任何数据包经物理网卡直连——Zero-Egress Guarantee。"),
-        ("Pinned Routing 域名置顶路由", "目标服务全家族域名及其生态依赖（Turnstile 人机验证、Telemetry 遥测、Payment 支付、Support 组件）置顶锁定代理路由，优先级高于任何第三方分流规则集，免疫规则库误判。"),
-        ("Session Isolation 会话隔离快照", "多账号采用完整快照隔离：各账号持有独立的 Device Fingerprint、OAuth Credential 与本地状态，切换即物理交换数据卷，账号间零交叉污染。"),
-        ("Drift Self-Healing 配置漂移自愈", "针对系统时区漂移、代理组件升级导致的配置重置等常见问题，内置 Watchdog 周期性校验并自动回滚至基线状态，全程留痕、可审计。"),
-        ("Anti-Tracking 反追踪卫生", "验证链接（Magic Link）闭环于受保护环境内打开；邮件追踪像素（Tracking Pixel）经由邮箱服务商代理层屏蔽；全程固定单一住宅出口，不产生 Geo 跳变。"),
+        ("Shadowrocket 网络检查", "检查系统 VPN 状态、Packet Tunnel 进程、Claude Fake-IP 路由和美国出口。Fake-IP 只能作为网络健康信号，不证明所有 DNS 或应用流量都没有绕行。"),
+        ("14 项状态", "必要网络故障阻止启动；系统时区、地区、客户端语言等保留原设置并显示提示。STUN 无响应表示无法确认，不伪装为已经证实安全。"),
+        ("用户级断线保护", "保护仅作用于通过本切换器启动的 Claude 会话。每两秒检查隧道，定期检查出口和当前配置。检测到故障会终止该会话；检测存在时间窗口，不保证零泄漏。"),
+        ("独立路由配置", "在当前 Shadowrocket 配置副本顶部加入 Claude 及相关服务的 13 条代理规则，保留现有 Tailscale 和其他分流。配置生效后才允许启动。"),
+        ("账号数据快照", "首次将当前 Claude 数据保存为 A；B 首次启动需要登录。切换前完全退出 Claude，校验参数并加互斥锁，复制失败不覆盖原数据，未完成事务可恢复。系统钥匙串不参与复制，登录兼容性需实际账号验证。"),
+        ("隐私与恢复", "日志不包含 IP 或凭据。安装会备份旧程序；快照文件仅当前用户可访问。恢复不会绕过启动安检。")
     ]
 
     var body: some View {
@@ -402,7 +476,7 @@ struct NoticeView: View {
 
                 ScrollView {
                     VStack(spacing: 10) {
-                        Text("本产品面向对账号环境一致性有严格要求的专业用户，基于 Fail-Closed（故障即断）原则构建，针对目标平台的 Risk Control 体系提供全链路防护，确保本地真实出口在任何场景下零暴露。")
+                        Text("此版本使用 Shadowrocket，提供启动前检查、账号数据快照和可选的用户级断线保护。黄色提示表示保留的环境差异或尚未证实的条件；绿色也不代表绝对无泄漏。")
                             .font(.callout)
                             .foregroundColor(.white.opacity(0.75))
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -419,7 +493,7 @@ struct NoticeView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 10))
                         }
 
-                        Text("本防护体系基于对目标平台风控机制的持续逆向分析与实战经验迭代。")
+                        Text("断线、IPv6、DNS 与登录态的实际表现取决于系统、节点及 Shadowrocket 配置。")
                             .font(.caption2)
                             .foregroundColor(.white.opacity(0.35))
                             .padding(.top, 8)
@@ -441,6 +515,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 @main
 struct SwitcherApp: App {
+    init() {
+        ProfileAccess.shared.restore()
+        if CommandLine.arguments.count >= 3 && CommandLine.arguments[1] == "--guard-helper" {
+            // Replace this process so launchd owns the actual guardian PID.
+            // This also avoids orphaning a Python process on kickstart/bootout.
+            let python = CommandLine.arguments[2]
+            let arguments = [python, NSHomeDirectory() + "/.claude-switcher/claude-switch.py", "guard"]
+            var argv = arguments.map { strdup($0) } + [nil]
+            argv.withUnsafeMutableBufferPointer { buffer in
+                _ = execv(python, buffer.baseAddress!)
+            }
+            exit(1)
+        }
+    }
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
